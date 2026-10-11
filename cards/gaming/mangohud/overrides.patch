@@ -710,3 +710,538 @@ index a5993aa56511..7c8e6d5a98ea 100644
     if (en[OVERLAY_PARAM_ENABLED_dx_api]) {
        if (engine == EngineTypes::VKD3D)
           return "DX12";
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: silentsudin <25103587+silentsudin@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 17:03:12 +0100
+Subject: cpu: fix Intel RAPL CPU power readings
+
+- Add a shared RaplCounter helper (src/rapl.h) that converts energy_uj to
+  watts with floating point math, real timestamps and wraparound handling
+  through max_energy_range_uj.
+- Prefer the MSR based intel-rapl zone over intel-rapl-mmio for package-0.
+- Subtract the "uncore" domain (the iGPU on Intel client parts) from
+  package power, so the iGPU is not reported as CPU power as well.
+- Keep retrying sensor discovery every 5 seconds instead of giving up after
+  five attempts, so permissions granted after startup take effect.
+- Warn (instead of a debug message) when energy_uj is not readable.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/cpu.cpp |  64 +++++++++++------------------
+ src/cpu.h   |  15 +++----
+ src/rapl.h  | 113 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 141 insertions(+), 51 deletions(-)
+ create mode 100644 src/rapl.h
+
+diff --git a/src/cpu.cpp b/src/cpu.cpp
+index f46fabad1a7b..9e9733774c29 100644
+--- a/src/cpu.cpp
++++ b/src/cpu.cpp
+@@ -410,27 +410,15 @@ static bool get_cpu_power_zenergy(CPUPowerData* cpuPowerData, float& power) {
+ static bool get_cpu_power_rapl(CPUPowerData* cpuPowerData, float& power) {
+     CPUPowerData_rapl* powerData_rapl = (CPUPowerData_rapl*)cpuPowerData;
+ 
+-    if (!powerData_rapl->energyCounterFile)
++    float package = 0.f;
++    if (!powerData_rapl->package.read(package))
+         return false;
+ 
+-    rewind(powerData_rapl->energyCounterFile);
+-    fflush(powerData_rapl->energyCounterFile);
+-
+-    uint64_t energyCounterValue = 0;
+-    if (fscanf(powerData_rapl->energyCounterFile, "%" SCNu64, &energyCounterValue) != 1)
+-        return false;
+-
+-    Clock::time_point now = Clock::now();
+-    Clock::duration timeDiff = now - powerData_rapl->lastCounterValueTime;
+-    int64_t timeDiffMicro = std::chrono::duration_cast<std::chrono::microseconds>(timeDiff).count();
+-    uint64_t energyCounterDiff = energyCounterValue - powerData_rapl->lastCounterValue;
+-
+-    if (powerData_rapl->lastCounterValue > 0 && energyCounterValue > powerData_rapl->lastCounterValue)
+-        power = energyCounterDiff / timeDiffMicro;
+-
+-    powerData_rapl->lastCounterValue = energyCounterValue;
+-    powerData_rapl->lastCounterValueTime = now;
++    float uncore = 0.f;
++    if (powerData_rapl->uncore.read(uncore))
++        package -= uncore;
+ 
++    power = package > 0.f ? package : 0.f;
+     return true;
+ }
+ 
+@@ -704,15 +692,12 @@ static CPUPowerData_zenergy* init_cpu_power_data_zenergy(const std::string path)
+ static CPUPowerData_rapl* init_cpu_power_data_rapl(const std::string path) {
+     auto powerData = std::make_unique<CPUPowerData_rapl>();
+ 
+-    std::string energyCounterPath = path + "/energy_uj";
+-    if (!file_exists(energyCounterPath)) return nullptr;
+-
+-    powerData->energyCounterFile = fopen(energyCounterPath.c_str(), "r");
+-    if (!powerData->energyCounterFile) {
+-        SPDLOG_DEBUG("Rapl: energy_uj is not accessible");
+-        powerData->energyCounterFile = nullptr;
++    if (!powerData->package.open(path))
+         return nullptr;
+-    }
++
++    std::string uncore = find_rapl_domain("uncore");
++    if (!uncore.empty() && powerData->uncore.open(uncore))
++        SPDLOG_DEBUG("Rapl: subtracting {} from package power", uncore);
+ 
+     return powerData.release();
+ }
+@@ -733,12 +718,16 @@ bool CPUStats::InitCpuPowerData() {
+     if(m_cpuPowerData != nullptr)
+         return true;
+ 
+-    // only try to find a valid method 5 times
++    // Try a few times quickly, then keep retrying slowly: sensors can become
++    // readable after startup (e.g. module load or a udev permission rule).
+     static int retries = 0;
+-    if (retries >= 5)
++    static Clock::time_point last_try;
++    Clock::time_point now = Clock::now();
++    if (retries >= 5 && now - last_try < std::chrono::seconds(5))
+         return true;
+ 
+     retries++;
++    last_try = now;
+     
+     std::string name, path;
+     std::string hwmon = "/sys/class/hwmon/";
+@@ -777,21 +766,14 @@ bool CPUStats::InitCpuPowerData() {
+     }
+ 
+     if (!cpuPowerData) {
+-        std::string powercap = "/sys/class/powercap/";
+-        auto powercap_dirs = ls(powercap.c_str());
+-        for (auto& dir : powercap_dirs) {
+-            path = powercap + dir;
+-            name = read_line(path + "/name");
+-            SPDLOG_DEBUG("powercap: name: {}", name);
+-            if (name == "package-0") {
+-                cpuPowerData = (CPUPowerData*)init_cpu_power_data_rapl(path);
+-                break;
+-            }
+-        }
++        std::string package = find_rapl_domain("package-0");
++        if (!package.empty())
++            cpuPowerData = (CPUPowerData*)init_cpu_power_data_rapl(package);
+     }
+-    
++
+     if(cpuPowerData == nullptr) {
+-        SPDLOG_ERROR("Failed to initialize CPU power data");
++        if (retries == 5)
++            SPDLOG_ERROR("Failed to initialize CPU power data");
+         return false;
+     }
+ 
+diff --git a/src/cpu.h b/src/cpu.h
+index d27c7887b005..d23f9a21bd5d 100644
+--- a/src/cpu.h
++++ b/src/cpu.h
+@@ -12,6 +12,7 @@
+ #endif
+ #include "timing.hpp"
+ #include "gpu.h"
++#include "rapl.h"
+ 
+ typedef struct CPUData_ {
+    unsigned long long int totalTime;
+@@ -128,18 +129,12 @@ struct CPUPowerData_zenergy : public CPUPowerData {
+ struct CPUPowerData_rapl : public CPUPowerData {
+    CPUPowerData_rapl() {
+       this->source = CPU_POWER_RAPL;
+-      this->lastCounterValue = 0;
+-      this->lastCounterValueTime = Clock::now();
+    };
+ 
+-   ~CPUPowerData_rapl() {
+-      if(this->energyCounterFile)
+-         fclose(this->energyCounterFile);
+-   };
+-
+-   FILE* energyCounterFile {nullptr};
+-   uint64_t lastCounterValue;
+-   Clock::time_point lastCounterValueTime;
++   RaplCounter package;
++   // Intel client parts account the iGPU in the "uncore" domain, which is also
++   // part of package-0. Subtract it so the iGPU is not counted as CPU power.
++   RaplCounter uncore;
+ };
+ 
+ struct CPUPowerData_amdgpu : public CPUPowerData {
+diff --git a/src/rapl.h b/src/rapl.h
+new file mode 100644
+index 000000000000..4c877cc3c039
+--- /dev/null
++++ b/src/rapl.h
+@@ -0,0 +1,113 @@
++#pragma once
++#ifndef MANGOHUD_RAPL_H
++#define MANGOHUD_RAPL_H
++
++#include <cerrno>
++#include <cinttypes>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <spdlog/spdlog.h>
++#include "file_utils.h"
++#include "timing.hpp"
++
++// Reads a powercap (Intel/AMD RAPL) energy_uj counter and turns it into watts.
++// Handles counter wraparound via max_energy_range_uj.
++struct RaplCounter {
++    FILE* file = nullptr;
++    uint64_t max_range = 0;
++    uint64_t last_value = 0;
++    Clock::time_point last_time;
++    bool primed = false;
++
++    RaplCounter() = default;
++    RaplCounter(const RaplCounter&) = delete;
++    RaplCounter& operator=(const RaplCounter&) = delete;
++    ~RaplCounter() { close(); }
++
++    void close() {
++        if (file)
++            fclose(file);
++        file = nullptr;
++        primed = false;
++    }
++
++    bool open(const std::string& domain_path) {
++        close();
++        std::string energy = domain_path + "/energy_uj";
++        file = fopen(energy.c_str(), "r");
++        if (!file) {
++            if (errno == EACCES)
++                SPDLOG_WARN("RAPL: {} is not readable (root-only by default). "
++                            "Allow reading it with a udev rule to get power readings.", energy);
++            else
++                SPDLOG_DEBUG("RAPL: cannot open {}: {}", energy, strerror(errno));
++            return false;
++        }
++
++        std::string range = read_line(domain_path + "/max_energy_range_uj");
++        max_range = range.empty() ? 0 : strtoull(range.c_str(), nullptr, 10);
++        return true;
++    }
++
++    bool is_open() const { return file != nullptr; }
++
++    // Returns false when no reading is available. The first successful call only
++    // primes the counter and reports 0 W.
++    bool read(float& watts) {
++        if (!file)
++            return false;
++
++        rewind(file);
++        fflush(file);
++
++        uint64_t value = 0;
++        if (fscanf(file, "%" SCNu64, &value) != 1)
++            return false;
++
++        Clock::time_point now = Clock::now();
++        watts = 0.f;
++
++        if (primed) {
++            int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(now - last_time).count();
++            uint64_t delta;
++            if (value >= last_value)
++                delta = value - last_value;
++            else if (max_range > last_value)
++                delta = max_range - last_value + value;
++            else
++                delta = 0;
++
++            if (us > 0)
++                watts = (float)((double)delta / (double)us);
++        }
++
++        last_value = value;
++        last_time = now;
++        primed = true;
++        return true;
++    }
++};
++
++// Finds the powercap domain with the given name ("package-0", "uncore", "core"...),
++// preferring the MSR based intel-rapl/amd-rapl zones over intel-rapl-mmio.
++static inline std::string find_rapl_domain(const std::string& domain_name) {
++    const std::string powercap = "/sys/class/powercap/";
++    std::string fallback;
++
++    for (auto& dir : ls(powercap.c_str())) {
++        std::string path = powercap + dir;
++        if (read_line(path + "/name") != domain_name)
++            continue;
++
++        if (dir.find("mmio") == std::string::npos)
++            return path;
++
++        if (fallback.empty())
++            fallback = path;
++    }
++
++    return fallback;
++}
++
++#endif // MANGOHUD_RAPL_H
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: silentsudin <25103587+silentsudin@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 17:03:12 +0100
+Subject: gpu_fdinfo: support Intel integrated GPU power and memory
+
+xe only registers hwmon for discrete GPUs, so integrated Intel GPUs
+always reported 0 W and 0 GiB.
+
+- Read GPU power from the RAPL "uncore" powercap domain when an xe/i915
+  device has no hwmon power/energy sensor.
+- Detect integrated memory (drm-resident-gtt / drm-resident-system0) on
+  every update instead of only in the constructor, where the tracked fds
+  may not have any allocations yet.
+- Report system-wide GPU memory for xe integrated GPUs through
+  DRM_XE_DEVICE_QUERY_MEM_REGIONS (sysmem region used/total) in
+  sys_vram_used/memoryTotal, so the VRAM row shows real usage.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gpu_fdinfo.cpp | 128 +++++++++++++++++++++++++++++++++++++++++++++
+ src/gpu_fdinfo.h   |  30 +++++------
+ 2 files changed, 143 insertions(+), 15 deletions(-)
+
+diff --git a/src/gpu_fdinfo.cpp b/src/gpu_fdinfo.cpp
+index 0fdd99e83621..481c4a24a0c4 100644
+--- a/src/gpu_fdinfo.cpp
++++ b/src/gpu_fdinfo.cpp
+@@ -4,6 +4,13 @@
+ #include "hud_elements.h"
+ #endif
+ 
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#if __has_include(<drm/xe_drm.h>)
++#include <drm/xe_drm.h>
++#define HAVE_XE_DRM_H 1
++#endif
++
+ namespace fs = ghc::filesystem;
+ 
+ void GPU_fdinfo::find_fd()
+@@ -145,6 +152,96 @@ uint64_t GPU_fdinfo::get_gpu_time_panfrost() {
+     return total;
+ }
+ 
++static bool fdinfo_has_value(
++    const std::vector<std::map<std::string, std::string>>& data, const std::string& key)
++{
++    for (auto& fd : data) {
++        auto it = fd.find(key);
++        if (it != fd.end() && !it->second.empty())
++            return true;
++    }
++
++    return false;
++}
++
++// Discrete Intel GPUs report vram (local0/vram0) in fdinfo, integrated ones only
++// system memory. Re-evaluated every update, because the fds tracked at startup
++// may not have any allocations yet.
++void GPU_fdinfo::update_memory_type()
++{
++    if (integrated_memory || fdinfo_data.empty())
++        return;
++
++    std::string sysmem_type;
++    if (module == "i915")
++        sysmem_type = "drm-resident-system0";
++    else if (module == "xe")
++        sysmem_type = "drm-resident-gtt";
++    else
++        return;
++
++    if (fdinfo_has_value(fdinfo_data, drm_memory_type) ||
++        !fdinfo_has_value(fdinfo_data, sysmem_type))
++        return;
++
++    SPDLOG_DEBUG(
++        "\"{}\" is not found, you probably have an integrated GPU. "
++        "Using \"{}\"", drm_memory_type, sysmem_type
++    );
++
++    drm_memory_type = sysmem_type;
++    integrated_memory = true;
++}
++
++// System-wide GPU memory in system RAM, as accounted by xe for all clients.
++bool GPU_fdinfo::get_xe_sysmem_usage(float& used, float& total)
++{
++#ifdef HAVE_XE_DRM_H
++    if (module != "xe")
++        return false;
++
++    if (xe_fd < 0) {
++        xe_fd = open(("/dev/dri/" + drm_node).c_str(), O_RDWR | O_CLOEXEC);
++        if (xe_fd < 0)
++            return false;
++    }
++
++    struct drm_xe_device_query query = {};
++    query.query = DRM_XE_DEVICE_QUERY_MEM_REGIONS;
++
++    if (ioctl(xe_fd, DRM_IOCTL_XE_DEVICE_QUERY, &query) || query.size == 0)
++        return false;
++
++    std::vector<uint8_t> buf(query.size);
++    query.data = reinterpret_cast<uintptr_t>(buf.data());
++
++    if (ioctl(xe_fd, DRM_IOCTL_XE_DEVICE_QUERY, &query))
++        return false;
++
++    auto regions = reinterpret_cast<struct drm_xe_query_mem_regions*>(buf.data());
++    for (uint32_t i = 0; i < regions->num_mem_regions; i++) {
++        auto& region = regions->mem_regions[i];
++
++        // A vram region means a discrete GPU, which is not handled here.
++        if (region.mem_class == DRM_XE_MEM_REGION_CLASS_VRAM)
++            return false;
++    }
++
++    for (uint32_t i = 0; i < regions->num_mem_regions; i++) {
++        auto& region = regions->mem_regions[i];
++
++        if (region.mem_class != DRM_XE_MEM_REGION_CLASS_SYSMEM || region.used == 0)
++            continue;
++
++        used = static_cast<float>(region.used) / 1024 / 1024 / 1024;
++        total = static_cast<float>(region.total_size) / 1024 / 1024 / 1024;
++        return true;
++    }
++#endif
++
++    return false;
++}
++
+ float GPU_fdinfo::get_memory_used()
+ {
+     uint64_t total = 0;
+@@ -303,8 +400,27 @@ void GPU_fdinfo::get_current_hwmon_readings()
+     }
+ }
+ 
++bool GPU_fdinfo::has_hwmon_power()
++{
++    return !hwmon_sensors["power"].filename.empty() ||
++           !hwmon_sensors["energy"].filename.empty();
++}
++
+ float GPU_fdinfo::get_power_usage()
+ {
++    if ((module == "xe" || module == "i915") && !has_hwmon_power()) {
++        // Retry roughly every 10 seconds until the counter becomes readable.
++        if (!rapl_uncore.is_open() && rapl_uncore_retry++ % (10'000 / METRICS_UPDATE_PERIOD_MS) == 0) {
++            std::string uncore = find_rapl_domain("uncore");
++            if (!uncore.empty() && rapl_uncore.open(uncore))
++                SPDLOG_DEBUG("Using RAPL {} for integrated GPU power", uncore);
++        }
++
++        float watts = 0.f;
++        rapl_uncore.read(watts);
++        return watts;
++    }
++
+     if (!hwmon_sensors["power"].filename.empty())
+         return static_cast<float>(hwmon_sensors["power"].val) / 1'000'000;
+ 
+@@ -728,9 +844,21 @@ void GPU_fdinfo::main_thread()
+         gather_fdinfo_data();
+         get_current_hwmon_readings();
+ 
++        update_memory_type();
++
+         metrics.load = get_gpu_load();
+         metrics.proc_vram_used = get_memory_used();
+ 
++        if (integrated_memory || module == "xe") {
++            float used = 0.f, total = 0.f;
++            if (get_xe_sysmem_usage(used, total)) {
++                metrics.sys_vram_used = used;
++                metrics.memoryTotal = total;
++            } else if (integrated_memory) {
++                metrics.sys_vram_used = metrics.proc_vram_used;
++            }
++        }
++
+         metrics.powerUsage = get_power_usage();
+         metrics.powerLimit = static_cast<float>(hwmon_sensors["power_limit"].val) / 1'000'000;
+ 
+diff --git a/src/gpu_fdinfo.h b/src/gpu_fdinfo.h
+index 97e62e52651c..80a1114b7784 100644
+--- a/src/gpu_fdinfo.h
++++ b/src/gpu_fdinfo.h
+@@ -23,6 +23,7 @@
+ #include <filesystem.h>
+ 
+ #include "gpu_metrics_util.h"
++#include "rapl.h"
+ 
+ struct hwmon_sensor {
+     std::regex rx;
+@@ -91,6 +92,17 @@ private:
+     float get_power_usage();
+     float last_power = 0;
+ 
++    // Integrated Intel GPUs have no hwmon; their power is the RAPL "uncore" domain.
++    RaplCounter rapl_uncore;
++    unsigned rapl_uncore_retry = 0;
++    bool has_hwmon_power();
++
++    // Integrated GPUs place buffers in system memory (gtt) instead of vram.
++    bool integrated_memory = false;
++    void update_memory_type();
++    int xe_fd = -1;
++    bool get_xe_sysmem_usage(float& used, float& total);
++
+     std::ifstream gpu_clock_stream;
+     void find_i915_gt_dir();
+     void find_xe_gt_dir();
+@@ -156,21 +168,7 @@ public:
+             drm_memory_type = "drm-resident-memory";
+         }
+ 
+-        if (fdinfo_data.size() > 0 &&
+-            fdinfo_data[0].find(drm_memory_type) == fdinfo_data[0].end())
+-        {
+-            auto old_type = drm_memory_type;
+-
+-            if (module == "i915")
+-                drm_memory_type = "drm-resident-system0";
+-            else if (module == "xe")
+-                drm_memory_type = "drm-resident-gtt";
+-
+-            SPDLOG_DEBUG(
+-                "\"{}\" is not found, you probably have an integrated GPU. "
+-                "Using \"{}\"", old_type, drm_memory_type
+-            );
+-        }
++        update_memory_type();
+ 
+         SPDLOG_DEBUG(
+             "drm_engine_type = {}, drm_memory_type = {}",
+@@ -222,6 +220,8 @@ public:
+         stop_thread = true;
+         if (thread.joinable())
+             thread.join();
++        if (xe_fd >= 0)
++            close(xe_fd);
+     }
+ 
+     gpu_metrics copy_metrics() const
